@@ -1,0 +1,35 @@
+{
+  "seed": 123,
+  "source": "Offline full calendar & rosters with real names; synthetic outcomes",
+  "notes": {
+    "grid_size": 20,
+    "races_per_season": 22,
+    "odds": "softmax of latent driver+team with overround; hazard = alpha*logit(p)",
+    "points": [
+      25,
+      18,
+      15,
+      12,
+      10,
+      8,
+      6,
+      4,
+      2,
+      1
+    ],
+    "laps_fraction": 0.35
+  },
+  "files": [
+    "seasons.csv",
+    "constructors.csv",
+    "drivers.csv",
+    "tracks.csv",
+    "races.csv",
+    "driver_constructors.csv",
+    "race_entries.csv",
+    "pitstops.csv",
+    "safetycars.csv",
+    "odds_snapshots.csv",
+    "laps.csv"
+  ]
+}
