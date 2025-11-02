@@ -1,6 +1,29 @@
 # f1_dynamic_update.py
-# Race-by-race Bayesian updating of Driver/Constructor effects + DCSI
-# Uses sequential priors (posterior -> next prior) and writes race-level & cumulative CSVs.
+# Dynamic Bayesian DCSI with split-aware TRAIN/TEST/VAL behavior.
+# Defaults:
+#   TRAIN -> FIT (sequential MCMC/ADVI) + save priors
+#   TEST  -> PREDICT-ONLY using TRAIN priors (no fitting, no updates)
+#   VAL   -> PREDICT-ONLY using TRAIN priors (no fitting, no updates)
+#
+# Env flags:
+#   F1_DATA_DIR       (default: data/synth_f1_2018_2025_realish)
+#   F1_OUT_DIR        (default: outputs/f1_dynamic)
+#   F1_SPLITS_CSV     (default: outputs/splits/splits.csv)
+#   F1_SPLIT_TARGET   TRAIN | TEST | VAL   (default: TRAIN)
+#   F1_RUN_MODE       fit | predict        (default: auto: TRAIN->fit, TEST/VAL->predict)
+#   F1_SAVE_PRIORS    1/0                  (default: 1 for TRAIN, ignored otherwise)
+#   F1_PRIORS_PATH    (default: {OUT_DIR}/priors.npz)  # where to save/load priors
+#
+# Inference (fit mode only):
+#   F1_INFER          advi|nuts (default advi)
+#   F1_ADVI_STEPS     (default 4000)
+#   F1_NUTS_DRAWS     (default 800)
+#   F1_NUTS_TUNE      (default 800)
+#   F1_SEED           (default 123)
+#
+# Priors:
+#   F1_PRIOR_SD_DRIVER (default 0.20)
+#   F1_PRIOR_SD_TEAM   (default 0.15)
 
 import os
 from pathlib import Path
@@ -9,7 +32,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
 import pandas as pd
-import arviz as az
 import pymc as pm
 
 # ---------------- Config ----------------
@@ -19,7 +41,13 @@ Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 FIG_DIR = os.path.join(OUT_DIR, "figs")
 Path(FIG_DIR).mkdir(parents=True, exist_ok=True)
 
-# Inference settings
+SPLITS_CSV    = os.environ.get("F1_SPLITS_CSV", "outputs/splits/splits.csv")
+SPLIT_TARGET  = os.environ.get("F1_SPLIT_TARGET", "TRAIN").upper()   # TRAIN | TEST | VAL
+RUN_MODE_ENV  = os.environ.get("F1_RUN_MODE", "").lower()            # "fit" | "predict" | ""
+SAVE_PRIORS   = os.environ.get("F1_SAVE_PRIORS", "1") == "1"
+PRIORS_PATH   = os.environ.get("F1_PRIORS_PATH", os.path.join(OUT_DIR, "priors.npz"))
+
+# Inference settings (for FIT mode)
 INFER_METHOD   = os.environ.get("F1_INFER", "advi")  # "advi" (fast) or "nuts"
 ADVI_STEPS     = int(os.environ.get("F1_ADVI_STEPS", "4000"))
 NUTS_DRAWS     = int(os.environ.get("F1_NUTS_DRAWS", "800"))
@@ -33,7 +61,7 @@ PRIOR_SD_ALPHA  = 0.50
 PRIOR_SD_BETA   = 0.25
 LIKELIHOOD_SD_INIT = 0.20  # initial guess for perf noise
 
-# ---------------- Load data ----------------
+# ---------------- Load core data ----------------
 entries = pd.read_csv(os.path.join(DATA_DIR, "race_entries.csv"))
 drivers = pd.read_csv(os.path.join(DATA_DIR, "drivers.csv"))
 teams   = pd.read_csv(os.path.join(DATA_DIR, "constructors.csv"))
@@ -46,7 +74,7 @@ df = (entries
       .merge(races[["race_id","season_id","round","track_id","weather","laps_scheduled","sc_total","rain_mm"]],
              on="race_id", how="left"))
 
-# Keep classified with valid gaps
+# Keep classified with valid gaps (we still compute perf in predict mode for evaluation)
 df = df[(df["classified"] == True) & (~df["time_gap_s"].isna())].copy()
 
 # ---- PERF: min-max per race (higher = better)
@@ -60,7 +88,7 @@ df["street"] = df["street"].astype(int) if "street" in df.columns else 0
 df["wet"]    = (df["weather"].fillna("").str.lower().str.contains("wet|mixed")).astype(int)
 df["grid_c"] = df["grid"] - df.groupby("race_id")["grid"].transform("mean")
 
-# ---------------- Chronological order (robust build) ----------------
+# ---------------- Chronological order (robust) ----------------
 # ensure date exists in races for sorting; synthesize if missing
 if "date" not in races.columns:
     races = races.copy()
@@ -68,17 +96,103 @@ if "date" not in races.columns:
 
 race_order = (df[["race_id"]].drop_duplicates()
               .merge(races[["race_id","season_id","round","date"]], on="race_id", how="left"))
+
+# ---------------- Apply split (and never read VAL unless explicitly targeted) ----------------
+if not os.path.exists(SPLITS_CSV):
+    raise FileNotFoundError(f"Missing split file: {SPLITS_CSV}")
+
+splits = pd.read_csv(SPLITS_CSV)[["race_id","split"]]
+race_order = race_order.merge(splits, on="race_id", how="left")
+
+# Reject VAL unless requested
+if SPLIT_TARGET not in {"TRAIN","TEST","VAL"}:
+    raise ValueError("F1_SPLIT_TARGET must be TRAIN, TEST, or VAL")
+
+race_order = race_order[race_order["split"].isin(["TRAIN","TEST","VAL"])]
+race_order = race_order[race_order["split"] == SPLIT_TARGET]
 race_order = race_order.sort_values(["season_id","round"]).reset_index(drop=True)
+
 race_ids = race_order["race_id"].tolist()
 race_meta = race_order.set_index("race_id")[["season_id","round"]].to_dict("index")
+print(f"[INFO] Split={SPLIT_TARGET} -> {len(race_ids)} races")
 
-# ---------------- Sequential priors & outputs ----------------
+# ---------------- Decide run mode (fit vs predict) ----------------
+if RUN_MODE_ENV in {"fit","predict"}:
+    RUN_MODE = RUN_MODE_ENV
+else:
+    # default policy: TRAIN=fit, TEST/VAL=predict
+    RUN_MODE = "fit" if SPLIT_TARGET == "TRAIN" else "predict"
+
+print(f"[INFO] Run mode resolved to: {RUN_MODE}")
+
+# ---------------- Utilities ----------------
+def save_preds_csv(rows, fname):
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if len(out):
+        out.sort_values(["season_id","round","driver_name"], inplace=True)
+        path = os.path.join(OUT_DIR, fname)
+        out.to_csv(path, index=False)
+        print(f"✅ Wrote: {path}")
+    else:
+        print("No outputs produced.")
+
+# ---------------- PREDICT-ONLY path (TEST/VAL by default) ----------------
+if RUN_MODE == "predict":
+    # Load priors learned on TRAIN
+    if not os.path.exists(PRIORS_PATH):
+        raise FileNotFoundError(f"Missing priors from TRAIN: {PRIORS_PATH}")
+
+    npz = np.load(PRIORS_PATH, allow_pickle=True)
+    drv_mu_map = {d: m for d, m in zip(npz["drv_ids"], npz["drv_mus"])}
+    tm_mu_map  = {t: m for t, m in zip(npz["tm_ids"],  npz["tm_mus"])}
+    alpha0     = float(npz.get("alpha_mean_global", 0.0))
+    beta0      = npz.get("beta_mean_global", np.zeros(3))
+
+    # align beta to [grid_c, street, wet]
+    if beta0.shape[0] != 3:
+        beta0 = np.zeros(3)
+
+    rows = []
+    for rid in race_ids:
+        rdf = df[df["race_id"] == rid].copy().reset_index(drop=True)
+        if len(rdf) < 8:
+            continue
+
+        X = rdf[["grid_c","street","wet"]].to_numpy(float)
+        drv = rdf["driver_id"].map(drv_mu_map).fillna(0.0).to_numpy(float)
+        tm  = rdf["constructor_id"].map(tm_mu_map).fillna(0.0).to_numpy(float)
+        pred_perf = alpha0 + drv + tm + (X @ beta0)
+
+        meta = race_meta.get(rid, {"season_id": None, "round": None})
+        tmp = rdf[[
+            "race_id","driver_id","driver_name","constructor_id","constructor_name",
+            "grid","finish_position","perf","street","wet"
+        ]].copy()
+        tmp["season_id"] = meta["season_id"]
+        tmp["round"]     = meta["round"]
+        tmp["pred_perf"] = pred_perf
+
+        # Optional: expose the components used for explainability
+        tmp["driver_eff_mean"] = drv
+        tmp["team_eff_mean"]   = tm
+        rows.append(tmp)
+
+    # Write predictions to the same filename the downstream scripts expect
+    save_preds_csv(rows, "dcsi_race.csv")
+    # No cumulative tables in predict-only mode (to avoid "learning" on holdout)
+    raise SystemExit(0)
+
+# ---------------- FIT path (TRAIN by default) ----------------
+# Sequential priors & outputs
 driver_prior = {}  # {driver_id: (mean, sd)}
 team_prior   = {}  # {constructor_id: (mean, sd)}
 
 rows_race = []     # per-race DCSI rows
 driver_cum = {}    # {driver_id: [posterior means]}
 team_cum   = {}    # {team_id: [posterior means]}
+
+alpha_hist = []
+beta_hist  = []
 
 def get_prior(id_, prior_dict, default_sd):
     if id_ in prior_dict:
@@ -149,22 +263,19 @@ def fit_one_race(rdf, rng_seed=RNG_SEED):
 
     mu_hat = alpha_mean + drv_mean[di] + tm_mean[ti] + (X @ beta_mean)
 
-    # variance-based weights (simple proxy for decomposition)
-    var_d = float(np.mean(drv_sd**2))
-    var_t = float(np.mean(tm_sd**2))
-    w_driver = var_d / (var_d + var_t + sigma_mean**2 + 1e-9)
-    w_team   = 1.0 - w_driver
+    # record for global averages
+    alpha_hist.append(alpha_mean)
+    beta_hist.append(beta_mean)
 
     return {
-        "idata": idata,
-        "drv_index": drv_index, "tm_index": tm_index,
+        "drv_index": {**drv_index}, "tm_index": {**tm_index},
         "drv_mean": drv_mean, "drv_sd": drv_sd,
         "tm_mean": tm_mean, "tm_sd": tm_sd,
         "alpha_mean": alpha_mean, "beta_mean": beta_mean, "sigma_mean": sigma_mean,
-        "mu_hat": mu_hat, "w_driver": w_driver, "w_team": w_team
+        "mu_hat": mu_hat
     }
 
-# ---------------- Run sequentially ----------------
+# ---------------- Train sequentially ----------------
 for rid in race_ids:
     rdf = df[df["race_id"] == rid].copy().reset_index(drop=True)
     if len(rdf) < 8:
@@ -182,7 +293,7 @@ for rid in race_ids:
         update_prior(t, res["tm_mean"][idx], res["tm_sd"][idx], team_prior)
         team_cum.setdefault(t, []).append(res["tm_mean"][idx])
 
-    # Emit race-level rows (inject season/round from race_meta to avoid KeyErrors)
+    # Emit race-level rows (inject season/round)
     meta = race_meta.get(rid, {"season_id": None, "round": None})
     tmp = rdf[[
         "race_id","driver_id","driver_name","constructor_id","constructor_name",
@@ -192,13 +303,11 @@ for rid in race_ids:
     tmp["round"]     = meta["round"]
     tmp["pred_perf"] = res["mu_hat"]
 
-    # attach posterior means used for decomposition
+    # attach posterior means (for explainability and later comparisons)
     di = rdf["driver_id"].map(res["drv_index"]).to_numpy()
     ti = rdf["constructor_id"].map(res["tm_index"]).to_numpy()
     tmp["driver_eff_mean"] = res["drv_mean"][di]
     tmp["team_eff_mean"]   = res["tm_mean"][ti]
-    tmp["dcsi_weight_driver"] = res["w_driver"]
-    tmp["dcsi_weight_team"]   = res["w_team"]
 
     # Per-entry normalized shares (|driver| vs |team|)
     total_abs = np.abs(tmp["driver_eff_mean"]) + np.abs(tmp["team_eff_mean"]) + 1e-9
@@ -207,13 +316,12 @@ for rid in race_ids:
 
     rows_race.append(tmp)
 
-# ---------------- Save outputs ----------------
+# ---------------- Save TRAIN outputs ----------------
+save_preds_csv(rows_race, "dcsi_race.csv")
+
+# Cumulative tables (TRAIN only)
 race_out = pd.concat(rows_race, ignore_index=True) if rows_race else pd.DataFrame()
 if len(race_out):
-    race_out.sort_values(["season_id","round","driver_name"], inplace=True)
-    race_out.to_csv(os.path.join(OUT_DIR, "dcsi_race.csv"), index=False)
-
-    # Cumulative tables
     drv_means = {k: np.mean(v) for k,v in driver_cum.items()}
     team_means= {k: np.mean(v) for k,v in team_cum.items()}
 
@@ -230,8 +338,25 @@ if len(race_out):
     tm_df.to_csv(os.path.join(OUT_DIR, "dcsi_cumulative_constructors.csv"), index=False)
 
     print("✅ Wrote:")
-    print(" -", os.path.join(OUT_DIR, "dcsi_race.csv"))
     print(" -", os.path.join(OUT_DIR, "dcsi_cumulative_drivers.csv"))
     print(" -", os.path.join(OUT_DIR, "dcsi_cumulative_constructors.csv"))
-else:
-    print("No race outputs were produced. Check your input dataset and filters.")
+
+# ---------------- Save priors for holdout prediction ----------------
+if SAVE_PRIORS and SPLIT_TARGET == "TRAIN":
+    alpha_mean_global = float(np.mean(alpha_hist)) if alpha_hist else 0.0
+    beta_mean_global  = np.mean(beta_hist, axis=0) if len(beta_hist) else np.zeros(3)
+
+    drv_ids = np.array(list(driver_prior.keys()))
+    drv_mus = np.array([driver_prior[k][0] for k in drv_ids])
+    drv_sds = np.array([driver_prior[k][1] for k in drv_ids])
+
+    tm_ids  = np.array(list(team_prior.keys()))
+    tm_mus  = np.array([team_prior[k][0] for k in tm_ids])
+    tm_sds  = np.array([team_prior[k][1] for k in tm_ids])
+
+    np.savez(PRIORS_PATH,
+             drv_ids=drv_ids, drv_mus=drv_mus, drv_sds=drv_sds,
+             tm_ids=tm_ids, tm_mus=tm_mus, tm_sds=tm_sds,
+             alpha_mean_global=alpha_mean_global,
+             beta_mean_global=beta_mean_global)
+    print(f"💾 Saved priors to {PRIORS_PATH}")

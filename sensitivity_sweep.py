@@ -1,13 +1,16 @@
 # sensitivity_sweep.py
-# Stress-test the Dynamic DCSI pipeline:
-# - Sweep prior SDs for drivers/constructors
-# - Feature ablations (drop street, wet, grid_c)
-# - ADVI vs NUTS (limited season for speed)
+# TRAIN-ONLY sensitivity & stress tests for the Dynamic DCSI pipeline.
+# It NEVER reads TEST or VAL (enforced via splits.csv).
 #
-# Outputs -> outputs/f1_dynamic/sensitivity/
-#   - summary.csv (one row per variant with rank stability vs baseline)
-#   - <variant_id>_drivers.csv  (driver cumulative leaderboard)
-#   - <variant_id>_constructors.csv (constructor cumulative leaderboard)
+# Outputs -> {F1_OUT_DIR}/sensitivity/
+#   - summary.csv (rank stability vs baseline)
+#   - <variant>_drivers.csv
+#   - <variant>_constructors.csv
+#
+# Env:
+#   F1_DATA_DIR   (default: data/synth_f1_2018_2025_realish)
+#   F1_OUT_DIR    (default: outputs/f1_dynamic_train)  # recommend pointing at your TRAIN folder
+#   F1_SPLITS_CSV (default: outputs/splits/splits.csv)
 
 import os
 from pathlib import Path
@@ -21,40 +24,44 @@ from scipy.stats import kendalltau, spearmanr
 
 # ---------------- Config ----------------
 DATA_DIR = os.environ.get("F1_DATA_DIR", "data/synth_f1_2018_2025_realish")
-OUT_DIR  = os.environ.get("F1_OUT_DIR",  "outputs/f1_dynamic")
+OUT_DIR  = os.environ.get("F1_OUT_DIR",  "outputs/f1_dynamic_train")
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 SENS_DIR = os.path.join(OUT_DIR, "sensitivity")
 Path(SENS_DIR).mkdir(parents=True, exist_ok=True)
 
-# Default model hyperparams (baseline)
+SPLITS_CSV = os.environ.get("F1_SPLITS_CSV", "outputs/splits/splits.csv")
+if not os.path.exists(SPLITS_CSV):
+    raise FileNotFoundError(f"Missing splits file: {SPLITS_CSV}")
+
+# Baseline settings
 BASE = dict(
     prior_sd_driver=0.20,
     prior_sd_team=0.15,
-    infer="advi",
+    infer="advi",         # "advi" | "nuts"
     advi_steps=2500,
     nuts_draws=600,
     nuts_tune=600,
     use_street=True,
     use_wet=True,
     use_gridc=True,
-    season_min=None,   # e.g. "2023" to limit; None = all
-    season_max=None
+    # Train-only sweep; keep all seasons in TRAIN by default
+    season_min=None,
+    season_max=None,
 )
 
-# Variants to run (add/remove as needed)
+# Variants (all will be TRAIN-only)
 VARIANTS = [
-    # --- Prior SD sweeps ---
     dict(name="prior_d_0.10", prior_sd_driver=0.10),
     dict(name="prior_d_0.30", prior_sd_driver=0.30),
     dict(name="prior_t_0.10", prior_sd_team=0.10),
     dict(name="prior_t_0.25", prior_sd_team=0.25),
 
-    # --- Ablations (feature toggles) ---
-    dict(name="no_street",   use_street=False),
-    dict(name="no_wet",      use_wet=False),
-    dict(name="no_gridc",    use_gridc=False),
+    dict(name="no_street", use_street=False),
+    dict(name="no_wet",    use_wet=False),
+    dict(name="no_gridc",  use_gridc=False),
 
-    # --- Inference: NUTS on recent season only (speed) ---
-    dict(name="nuts_2024", infer="nuts", season_min="2024", season_max="2024",
+    # NUTS on a recent season subset (still TRAIN-only)
+    dict(name="nuts_recent", infer="nuts", season_min="2023", season_max="2023",
          nuts_draws=800, nuts_tune=800, advi_steps=None),
 ]
 
@@ -63,19 +70,18 @@ LIKELIHOOD_SD_INIT = 0.20
 PRIOR_SD_ALPHA = 0.50
 PRIOR_SD_BETA  = 0.25
 
-# ---------------- Data load ----------------
+# ---------------- Load data ----------------
 entries = pd.read_csv(os.path.join(DATA_DIR, "race_entries.csv"))
 drivers = pd.read_csv(os.path.join(DATA_DIR, "drivers.csv"))
 teams   = pd.read_csv(os.path.join(DATA_DIR, "constructors.csv"))
 races   = pd.read_csv(os.path.join(DATA_DIR, "races.csv"))
+splits  = pd.read_csv(SPLITS_CSV)[["race_id","split"]]
 
-# Prepare base dataframe (names + race meta)
+# Base df (names + race meta)
 df = (entries
       .merge(drivers[["driver_id","driver_name"]], on="driver_id", how="left")
       .merge(teams[["constructor_id","constructor_name"]], on="constructor_id", how="left")
-      .merge(races[["race_id","season_id","round","track_id","weather","laps_scheduled","sc_total","rain_mm","date"]]
-             if "date" in races.columns else
-             races[["race_id","season_id","round","track_id","weather","laps_scheduled","sc_total","rain_mm"]],
+      .merge(races[["race_id","season_id","round","track_id","weather","laps_scheduled","sc_total","rain_mm"]],
              on="race_id", how="left"))
 
 # keep usable rows
@@ -87,27 +93,37 @@ g = df.groupby("race_id")["time_gap_s"]
 df["perf"] = 1.0 - (df["time_gap_s"] - g.transform("min")) / (g.transform("max") - g.transform("min") + eps)
 df["perf"] = df["perf"].clip(0.0, 1.0)
 
-# Ensure date for sort
-if "date" not in df.columns:
+# ensure date for sorting (robust)
+if "date" not in races.columns:
     races = races.copy()
     races["date"] = pd.to_datetime(races["season_id"].astype(str) + "-01-01") + pd.to_timedelta(races["round"] * 14, unit="D")
-    df = df.merge(races[["race_id","date"]], on="race_id", how="left")
 
-# Helpers for ranking stability
+df = df.merge(races[["race_id","date"]], on="race_id", how="left")
+
+# Features
+df["street"] = df["street"].astype(int) if "street" in df.columns else 0
+df["wet"]    = (df["weather"].fillna("").str.lower().str.contains("wet|mixed")).astype(int)
+df["grid_c"] = df["grid"] - df.groupby("race_id")["grid"].transform("mean")
+
+# ---------------- Enforce TRAIN-only ----------------
+df = df.merge(splits, on="race_id", how="left")
+df = df[df["split"] == "TRAIN"].copy()
+if df.empty:
+    raise RuntimeError("TRAIN split has no rows. Check your splits.csv and data.")
+
+# ---------------- Helpers ----------------
 def rank_corr(df_a: pd.DataFrame, df_b: pd.DataFrame, key: str, score_col: str):
-    # Align on key and compute Kendall tau / Spearman rho of ranks (descending by score)
     a = df_a[[key, score_col]].dropna().copy()
     b = df_b[[key, score_col]].dropna().copy()
     m = a.merge(b, on=key, suffixes=("_a","_b"))
     if len(m) < 3:
-        return np.nan, np.nan, len(m)
-    m["rank_a"] = m["{}_a".format(score_col)].rank(ascending=False, method="average")
-    m["rank_b"] = m["{}_b".format(score_col)].rank(ascending=False, method="average")
+        return np.nan, np.nan, int(len(m))
+    m["rank_a"] = m[f"{score_col}_a"].rank(ascending=False, method="average")
+    m["rank_b"] = m[f"{score_col}_b"].rank(ascending=False, method="average")
     tau, _ = kendalltau(m["rank_a"], m["rank_b"])
     rho, _ = spearmanr(m["rank_a"], m["rank_b"])
     return float(tau), float(rho), int(len(m))
 
-# Core sequential fitter (mini version of f1_dynamic_update.py)
 def run_dynamic(config: dict):
     prior_sd_driver = config.get("prior_sd_driver", BASE["prior_sd_driver"])
     prior_sd_team   = config.get("prior_sd_team",   BASE["prior_sd_team"])
@@ -121,66 +137,35 @@ def run_dynamic(config: dict):
     smin            = config.get("season_min",      BASE["season_min"])
     smax            = config.get("season_max",      BASE["season_max"])
 
-    # Slice seasons if requested
+    # slice seasons within TRAIN if requested
     d = df.copy()
-    need_cols = {"season_id", "round", "date"}
-    if not need_cols.issubset(set(d.columns)):
-        races_fix = races.copy()
-        if "date" not in races_fix.columns:
-            races_fix["date"] = pd.to_datetime(races_fix["season_id"].astype(str) + "-01-01") \
-                                + pd.to_timedelta(races_fix["round"] * 14, unit="D")
-        d = d.merge(races_fix[["race_id", "season_id", "round", "date"]],
-                    on="race_id", how="left")
     if smin is not None:
         d = d[d["season_id"].astype(str) >= str(smin)]
     if smax is not None:
         d = d[d["season_id"].astype(str) <= str(smax)]
 
-    # features
-    d["street"] = d["street"].astype(int) if "street" in d.columns else 0
-    d["wet"]    = (d["weather"].fillna("").str.lower().str.contains("wet|mixed")).astype(int)
-    d["grid_c"] = d["grid"] - d.groupby("race_id")["grid"].transform("mean")
-
+    # pick features
     feats = []
     if use_gridc: feats.append("grid_c")
     if use_street: feats.append("street")
     if use_wet: feats.append("wet")
     if not feats:
-        feats = ["grid_c"]  # keep at least one to avoid degenerate dot; grid_c will be zero if not present
+        feats = ["grid_c"]  # safe default; will be zeros if grid is constant
 
-    # race order
-    # ---- Build race order robustly (never assume cols are present)
-    race_order = (
-        d[["race_id"]].drop_duplicates()
-        .merge(races[["race_id", "season_id", "round"]], on="race_id", how="left")
-    )
-    races_tmp = races.copy()
-    if "date" not in races_tmp.columns:
-        races_tmp["date"] = pd.to_datetime(races_tmp["season_id"].astype(str) + "-01-01") \
-                            + pd.to_timedelta(races_tmp["round"] * 14, unit="D")
-    race_order = race_order.merge(races_tmp[["race_id", "date"]], on="race_id", how="left")
-
-    race_order = race_order.sort_values(["season_id", "round"]).reset_index(drop=True)
+    # race order (chronological within TRAIN)
+    race_order = (d[["race_id"]].drop_duplicates()
+                  .merge(races[["race_id","season_id","round","date"]], on="race_id", how="left")
+                  .sort_values(["season_id","round"])
+                  .reset_index(drop=True))
     race_ids = race_order["race_id"].tolist()
-    meta = race_order.set_index("race_id")[["season_id", "round"]].to_dict("index")
 
-    # priors
-    d_prior = {}
-    t_prior = {}
-
-    def get_prior(id_, prior_dict, default_sd):
-        m,s = prior_dict.get(id_, (0.0, default_sd))
-        return m, max(s, 0.05)
-
-    def update_prior(id_, m, s, prior_dict):
-        prior_dict[id_] = (float(m), float(max(s, 0.05)))
-
-    rows = []
-    d_cum = {}
-    t_cum = {}
+    # sequential priors and accumulators
+    d_prior, t_prior = {}, {}
+    d_cum, t_cum = {}, {}
+    rng_seed = RNG_SEED
 
     for rid in race_ids:
-        rdf = d[d["race_id"] == rid].copy()
+        rdf = d[d["race_id"] == rid].copy().reset_index(drop=True)
         if len(rdf) < 8:
             continue
 
@@ -195,10 +180,11 @@ def run_dynamic(config: dict):
         di = rdf["driver_id"].map(di_map).to_numpy()
         ti = rdf["constructor_id"].map(ti_map).to_numpy()
 
-        drv_mu0 = np.array([get_prior(did, d_prior, prior_sd_driver)[0] for did in drv_ids])
-        drv_sd0 = np.array([get_prior(did, d_prior, prior_sd_driver)[1] for did in drv_ids])
-        tm_mu0  = np.array([get_prior(tid, t_prior, prior_sd_team)[0] for tid in tm_ids])
-        tm_sd0  = np.array([get_prior(tid, t_prior, prior_sd_team)[1] for tid in tm_ids])
+        # sequential priors
+        drv_mu0 = np.array([d_prior.get(did, (0.0, prior_sd_driver))[0] for did in drv_ids])
+        drv_sd0 = np.array([max(d_prior.get(did, (0.0, prior_sd_driver))[1], 0.05) for did in drv_ids])
+        tm_mu0  = np.array([t_prior.get(tid, (0.0, prior_sd_team))[0] for tid in tm_ids])
+        tm_sd0  = np.array([max(t_prior.get(tid, (0.0, prior_sd_team))[1], 0.05) for tid in tm_ids])
 
         with pm.Model() as m:
             alpha = pm.Normal("alpha", mu=0.0, sigma=PRIOR_SD_ALPHA)
@@ -212,11 +198,11 @@ def run_dynamic(config: dict):
 
             if infer == "nuts":
                 idata = pm.sample(draws=nuts_draws, tune=nuts_tune, chains=2,
-                                  target_accept=0.9, random_seed=RNG_SEED,
+                                  target_accept=0.9, random_seed=rng_seed,
                                   progressbar=False)
             else:
-                approx = pm.fit(n=advi_steps, random_seed=RNG_SEED, progressbar=False)
-                idata  = approx.sample(draws=1000, random_seed=RNG_SEED)
+                approx = pm.fit(n=advi_steps, random_seed=rng_seed, progressbar=False)
+                idata  = approx.sample(draws=1000, random_seed=rng_seed)
 
         post = idata.posterior
         drv_mean = post["theta_d"].mean(dim=["chain","draw"]).values
@@ -224,31 +210,25 @@ def run_dynamic(config: dict):
         tm_mean  = post["theta_t"].mean(dim=["chain","draw"]).values
         tm_sd    = post["theta_t"].std(dim=["chain","draw"]).values
 
-        # update priors
+        # update priors and accumulate
         for d_id, idx in di_map.items():
-            update_prior(d_id, drv_mean[idx], drv_sd[idx], d_prior)
+            d_prior[d_id] = (float(drv_mean[idx]), float(max(drv_sd[idx], 0.05)))
             d_cum.setdefault(d_id, []).append(drv_mean[idx])
-        for t_id, idx in ti_map.items():
-            update_prior(t_id, tm_mean[idx], tm_sd[idx], t_prior)
-            t_cum.setdefault(t_id, []).append(tm_mean[idx])
 
-        tmp = rdf[["race_id","driver_id","driver_name","constructor_id","constructor_name"]].copy()
-        tmp["season_id"] = meta[rid]["season_id"]
-        tmp["round"]     = meta[rid]["round"]
-        tmp["driver_eff_mean"] = drv_mean[di]
-        tmp["team_eff_mean"]   = tm_mean[ti]
-        rows.append(tmp)
+        for t_id, idx in ti_map.items():
+            t_prior[t_id] = (float(tm_mean[idx]), float(max(tm_sd[idx], 0.05)))
+            t_cum.setdefault(t_id, []).append(tm_mean[idx])
 
     # cumulative leaderboards
     drv_df = pd.DataFrame({
         "driver_id": list(d_cum.keys()),
-        "driver_eff_cum_mean": [np.mean(v) for v in d_cum.values()]
+        "driver_eff_cum_mean": [float(np.mean(v)) for v in d_cum.values()]
     }).merge(drivers[["driver_id","driver_name"]], on="driver_id", how="left") \
      .sort_values("driver_eff_cum_mean", ascending=False)
 
     tm_df = pd.DataFrame({
         "constructor_id": list(t_cum.keys()),
-        "team_eff_cum_mean": [np.mean(v) for v in t_cum.values()]
+        "team_eff_cum_mean": [float(np.mean(v)) for v in t_cum.values()]
     }).merge(teams[["constructor_id","constructor_name"]], on="constructor_id", how="left") \
      .sort_values("team_eff_cum_mean", ascending=False)
 
@@ -262,27 +242,25 @@ def save_variant(name, drv_df, tm_df):
     return drv_path, tm_path
 
 # ---------------- Run baseline ----------------
-print("Running baseline…")
+print("[INFO] Running TRAIN-only sensitivity sweep")
 drv_base, tm_base = run_dynamic(BASE)
 save_variant("baseline", drv_base, tm_base)
 
 # ---------------- Run variants & compare ----------------
 rows_summary = []
 for v in VARIANTS:
-    cfg = BASE.copy()
-    cfg.update(v)  # apply overrides
+    cfg = BASE.copy(); cfg.update(v)
     vname = v.get("name") or f"variant_{len(rows_summary)+1}"
-    print(f"Running variant: {vname}")
+    print(f"[INFO] Variant: {vname}")
     drv_v, tm_v = run_dynamic(cfg)
     save_variant(vname, drv_v, tm_v)
 
-    # rank stability vs baseline
-    tau_d, rho_d, n_d = rank_corr(drv_base, drv_v, key="driver_id", score_col="driver_eff_cum_mean")
-    tau_t, rho_t, n_t = rank_corr(tm_base, tm_v, key="constructor_id", score_col="team_eff_cum_mean")
+    # rank stability vs baseline (drivers & constructors)
+    tau_d, rho_d, n_d = rank_corr(drv_base, drv_v, key="driver_id",      score_col="driver_eff_cum_mean")
+    tau_t, rho_t, n_t = rank_corr(tm_base,  tm_v,  key="constructor_id", score_col="team_eff_cum_mean")
 
     rows_summary.append({
         "variant": vname,
-        # settings
         "prior_sd_driver": cfg["prior_sd_driver"],
         "prior_sd_team":   cfg["prior_sd_team"],
         "infer":           cfg["infer"],
@@ -291,7 +269,6 @@ for v in VARIANTS:
         "use_gridc":       cfg["use_gridc"],
         "season_min":      cfg["season_min"],
         "season_max":      cfg["season_max"],
-        # metrics
         "drivers_kendall_tau": tau_d,
         "drivers_spearman_rho": rho_d,
         "drivers_overlap_n": n_d,
@@ -304,8 +281,8 @@ summary = pd.DataFrame(rows_summary)
 summary_path = os.path.join(SENS_DIR, "summary.csv")
 summary.to_csv(summary_path, index=False)
 
-print("\n✅ Sensitivity sweep complete.")
+print("\n✅ Sensitivity sweep complete (TRAIN only).")
 print(" - Summary:", summary_path)
-print(" - Baseline leaderboards:", os.path.join(SENS_DIR, "baseline_drivers.csv"),
+print(" - Baseline:", os.path.join(SENS_DIR, "baseline_drivers.csv"),
       " & ", os.path.join(SENS_DIR, "baseline_constructors.csv"))
-print(" - Variants written alongside baseline in:", SENS_DIR)
+print(" - Variants saved alongside baseline in:", SENS_DIR)
