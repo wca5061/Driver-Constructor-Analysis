@@ -1,4 +1,4 @@
-# F1 Driver–Constructor Separation (DCSI) – Teammate README
+# F1 Driver–Constructor Separation (DCSI) – README
 
 This README shows you **exactly** how to run the project end-to-end in the right order with the correct files, environment variables, and expected outputs. Follow it line-by-line.
 
@@ -209,3 +209,108 @@ outputs/f1_dynamic_train/ → dcsi_race.csv, priors.npz, prob_metrics.json, figs
 outputs/f1_dynamic_test/ → dcsi_race.csv, dcsi_probs.csv, roll-ups CSVs, figs/
 
 (Optional) outputs/f1_parent_model/ → posterior.nc, posterior_*.csv, dcsi_race.csv, figs/
+
+## Next Steps (Phase II)
+
+Now that the full dynamic + split-aware pipeline is working, here’s what we need to do next.
+
+### 1. Verify Outputs & Sanity Check
+- Open `outputs/f1_dynamic_train/dcsi_cumulative_drivers.csv` and confirm top drivers look realistic (high-performing constructors but not perfect correlation).
+- Open `outputs/f1_dynamic_test/dcsi_probs.csv` — check that win/podium/points probabilities roughly sum to realistic values (no driver >0.8 win prob in a balanced race).
+- Use `quick_check_dynamic.py` and `build_rollups_explainable.py` to visually confirm ranking and calibration are sensible.
+
+---
+
+### 2. Add Pit Stop & Safety Car Effects
+Goal: quantify how much pit stop execution and safety cars influence results.
+
+- Modify `f1_dynamic_update.py` to include:
+  ```python
+  F1_USE_PIT=1
+  F1_USE_SC=1
+Add regressors:
+
+avg_pit_time_diff (per race, per team)
+
+sc_laps (safety car laps normalized by total)
+
+Rerun f1_dynamic_update.py for TRAIN and TEST.
+
+Compare DCSI changes and re-run make_probs_from_dynamic.py for recalibration.
+
+Output Goal: Understand which drivers gain or lose performance under chaotic race conditions.
+
+3. Cross-Split Generalization & Robustness
+Compare calibration metrics between TRAIN and TEST (prob_metrics.json files).
+
+Plot Brier and log-loss differences.
+
+Identify drivers or teams whose estimated effects drop significantly when tested out-of-sample.
+
+4. Export Dashboard-Ready JSONs
+Create a lightweight export for visualization:
+
+bash
+```
+python export_dashboard_json.py
+```
+That script (you can add next) should collect:
+
+Top 10 “Outperforming Car” drivers
+
+Team strength rankings
+
+Driver/constructor DCSI time series
+
+Calibration and duality metrics
+
+This can power a Streamlit or Dash front-end.
+
+5. Time–Rank Duality Analysis (already working)
+Use time_rank_duality.py (with frozen τ) to validate that time-based hazard probabilities ≈ rank-based PL probabilities.
+
+Examine duality_metrics.json for consistency between methods.
+
+Goal: Confirm that time-based and rank-based models agree within a few percentage points — supports our theoretical foundation.
+
+6. Sensitivity & Stability
+Run:
+
+bash
+```
+python sensitivity_sweep.py
+```
+to test robustness of DCSI to noise and priors.
+
+Review outputs/f1_dynamic_train/sensitivity/summary.csv.
+
+Goal: Prove model stability under small perturbations in hyperparameters.
+
+7. Paper & Presentation Prep
+Split writing tasks:
+
+Will: Model architecture, pipeline figure, calibration analysis.
+
+Ashish: Driver vs Constructor interpretation, case studies (e.g., Verstappen outperforming vs Leclerc carried).
+
+Include:
+
+Formula for DCSI decomposition
+
+Bayesian update diagram
+
+Time–Rank duality figure
+
+Calibration and reliability curves
+
+Target figures: trace_core.png, drivers_outperforming_cars_bar.png, prob_calibration_win.png, and duality_scatter_win_softmax_vs_pl.png.
+
+8. Future Enhancements
+Integrate real FastF1 data (once the API cache path works)
+
+Add weather- and track-type–specific hyperpriors
+
+Introduce live betting model updates using odds_snapshots.csv
+
+Publish results and visualizations via Streamlit or Observable dashboard
+
