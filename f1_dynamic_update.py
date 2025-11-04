@@ -61,6 +61,9 @@ PRIOR_SD_ALPHA  = 0.50
 PRIOR_SD_BETA   = 0.25
 LIKELIHOOD_SD_INIT = 0.20  # initial guess for perf noise
 
+USE_PIT = os.environ.get("F1_USE_PIT", "0") == "1"
+USE_SC  = os.environ.get("F1_USE_SC", "0") == "1"
+
 # ---------------- Load core data ----------------
 entries = pd.read_csv(os.path.join(DATA_DIR, "race_entries.csv"))
 drivers = pd.read_csv(os.path.join(DATA_DIR, "drivers.csv"))
@@ -84,9 +87,53 @@ df["perf"] = 1.0 - (df["time_gap_s"] - g.transform("min")) / (g.transform("max")
 df["perf"] = df["perf"].clip(0.0, 1.0)
 
 # Features (robust to missing)
+# Features (robust to missing)
 df["street"] = df["street"].astype(int) if "street" in df.columns else 0
 df["wet"]    = (df["weather"].fillna("").str.lower().str.contains("wet|mixed")).astype(int)
 df["grid_c"] = df["grid"] - df.groupby("race_id")["grid"].transform("mean")
+
+# NEW: pit stop & safety car regressors
+if USE_PIT:
+    # average total pit time per race/team, compared to race average
+    pit_team = (
+        df.groupby(["race_id", "constructor_id"])["pit_time_total_s"]
+          .mean()
+          .rename("team_avg_pit")
+          .reset_index()
+    )
+    pit_race = (
+        df.groupby("race_id")["pit_time_total_s"]
+          .mean()
+          .rename("race_avg_pit")
+          .reset_index()
+    )
+    pit = pit_team.merge(pit_race, on="race_id", how="left")
+    pit["avg_pit_time_diff"] = pit["team_avg_pit"] - pit["race_avg_pit"]
+
+    df = df.merge(
+        pit[["race_id", "constructor_id", "avg_pit_time_diff"]],
+        on=["race_id", "constructor_id"],
+        how="left",
+    )
+else:
+    df["avg_pit_time_diff"] = 0.0
+
+if USE_SC:
+    # race-level SC intensity: SC laps / total laps
+    # (races.csv already has sc_total and laps_scheduled)
+    df["sc_laps"] = (
+        df["sc_total"].fillna(0.0) /
+        df["laps_scheduled"].replace(0, np.nan)
+    ).fillna(0.0)
+else:
+    df["sc_laps"] = 0.0
+
+# Design-matrix columns (order matters!)
+FEATURE_COLS = ["grid_c", "street", "wet"]
+if USE_PIT:
+    FEATURE_COLS.append("avg_pit_time_diff")
+if USE_SC:
+    FEATURE_COLS.append("sc_laps")
 
 # ---------------- Chronological order (robust) ----------------
 # ensure date exists in races for sorting; synthesize if missing
@@ -145,12 +192,12 @@ if RUN_MODE == "predict":
     npz = np.load(PRIORS_PATH, allow_pickle=True)
     drv_mu_map = {d: m for d, m in zip(npz["drv_ids"], npz["drv_mus"])}
     tm_mu_map  = {t: m for t, m in zip(npz["tm_ids"],  npz["tm_mus"])}
-    alpha0     = float(npz.get("alpha_mean_global", 0.0))
-    beta0      = npz.get("beta_mean_global", np.zeros(3))
+    alpha0 = float(npz.get("alpha_mean_global", 0.0))
+    beta0 = npz.get("beta_mean_global", np.zeros(len(FEATURE_COLS)))
 
-    # align beta to [grid_c, street, wet]
-    if beta0.shape[0] != 3:
-        beta0 = np.zeros(3)
+    # align beta to FEATURE_COLS
+    if beta0.shape[0] != len(FEATURE_COLS):
+        beta0 = np.zeros(len(FEATURE_COLS))
 
     rows = []
     for rid in race_ids:
@@ -158,7 +205,8 @@ if RUN_MODE == "predict":
         if len(rdf) < 8:
             continue
 
-        X = rdf[["grid_c","street","wet"]].to_numpy(float)
+        X = rdf[FEATURE_COLS].to_numpy(float)
+
         drv = rdf["driver_id"].map(drv_mu_map).fillna(0.0).to_numpy(float)
         tm  = rdf["constructor_id"].map(tm_mu_map).fillna(0.0).to_numpy(float)
         pred_perf = alpha0 + drv + tm + (X @ beta0)
@@ -215,7 +263,7 @@ def fit_one_race(rdf, rng_seed=RNG_SEED):
     drv_index = {d:i for i,d in enumerate(drv_ids)}
     tm_index  = {t:i for i,t in enumerate(tm_ids)}
 
-    X = rdf[["grid_c","street","wet"]].to_numpy(dtype=float)
+    X = rdf[FEATURE_COLS].to_numpy(dtype=float)
     y = rdf["perf"].to_numpy(dtype=float)
 
     di = rdf["driver_id"].map(drv_index).to_numpy()
@@ -344,7 +392,7 @@ if len(race_out):
 # ---------------- Save priors for holdout prediction ----------------
 if SAVE_PRIORS and SPLIT_TARGET == "TRAIN":
     alpha_mean_global = float(np.mean(alpha_hist)) if alpha_hist else 0.0
-    beta_mean_global  = np.mean(beta_hist, axis=0) if len(beta_hist) else np.zeros(3)
+    beta_mean_global = np.mean(beta_hist, axis=0) if len(beta_hist) else np.zeros(len(FEATURE_COLS))
 
     drv_ids = np.array(list(driver_prior.keys()))
     drv_mus = np.array([driver_prior[k][0] for k in drv_ids])
