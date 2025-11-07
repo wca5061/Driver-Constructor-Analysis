@@ -1,4 +1,5 @@
-# 🏎️ Formula 1 Driver–Constructor Separation Index (DCSI)
+```markdown
+# Formula 1 Driver–Constructor Separation Index (DCSI)
 
 This repository implements a **Dynamic Bayesian Driver–Constructor Separation Index (DCSI)** for Formula 1 — estimating how much of a team's performance comes from the driver vs. the car.  
 
@@ -6,7 +7,7 @@ The pipeline builds synthetic (real-ish) data, performs 70/20 train-test splits,
 
 ---
 
-## ⚙️ 0) Setup
+## 0) Setup
 
 ### Requirements
 ```bash
@@ -34,7 +35,7 @@ pip install numpy pandas matplotlib arviz pymc scipy fastf1 plotly streamlit
 
 ---
 
-## 🚀 1) Build the Synthetic Dataset
+## 1) Build the Synthetic Dataset
 ```bash
 python dataset_builder.py
 ```
@@ -44,7 +45,7 @@ Creates CSVs under `data/synth_f1_2018_2025_realish/`
 
 ---
 
-## 🧩 2) Create 70/20 Train–Test Splits
+## 2) Create 70/20 Train–Test Splits
 ```bash
 F1_DATA_DIR="data/synth_f1_2018_2025_realish" \
 F1_OUT_DIR="outputs" \
@@ -55,7 +56,7 @@ Produces → `outputs/splits/splits.csv`
 
 ---
 
-## 🧠 3) Run Dynamic Model on TRAIN (Fits Priors)
+## 3) Run Dynamic Model on TRAIN (Fits Priors)
 ```bash
 F1_DATA_DIR="data/synth_f1_2018_2025_realish" \
 F1_OUT_DIR="outputs/f1_dynamic_train" \
@@ -79,7 +80,7 @@ python quick_check_dynamic.py
 
 ---
 
-## 🔮 4) Predict on TEST (Using TRAIN Priors)
+## 4) Predict on TEST (Using TRAIN Priors)
 ```bash
 F1_DATA_DIR="data/synth_f1_2018_2025_realish" \
 F1_OUT_DIR="outputs/f1_dynamic_test" \
@@ -93,7 +94,7 @@ Outputs → `outputs/f1_dynamic_test/dcsi_race.csv`
 
 ---
 
-## 📈 5) Convert Scores → Probabilities (Frozen τ)
+## 5) Convert Scores → Probabilities (Frozen τ)
 
 **Compute τ on TRAIN:**
 ```bash
@@ -119,7 +120,7 @@ python make_probs_from_dynamic.py
 
 ---
 
-## 🔍 6) Build Explainable Roll-Ups (TEST)
+## 6) Build Explainable Roll-Ups (TEST)
 ```bash
 F1_OUT_DIR="outputs/f1_dynamic_test" \
 F1_SPLITS_CSV="outputs/splits/splits.csv" \
@@ -138,7 +139,7 @@ python quick_check_dynamic.py
 
 ---
 
-## ⏱️ 7) Time–Rank Duality Evaluation (TEST)
+## 7) Time–Rank Duality Evaluation (TEST)
 ```bash
 F1_OUT_DIR="outputs/f1_dynamic_test" \
 F1_SPLITS_CSV="outputs/splits/splits.csv" \
@@ -152,7 +153,7 @@ python time_rank_duality.py
 
 ---
 
-## 🧮 8) (Optional) Parent Model Path
+## 8) (Optional) Parent Model Path
 
 **TRAIN:**
 ```bash
@@ -176,7 +177,7 @@ python f1_diagnostics.py
 
 ---
 
-## 🧪 9) Sensitivity Sweep (TRAIN Only)
+## 9) Sensitivity Sweep (TRAIN Only)
 ```bash
 F1_DATA_DIR="data/synth_f1_2018_2025_realish" \
 F1_OUT_DIR="outputs/f1_dynamic_train" \
@@ -188,7 +189,7 @@ Outputs → `outputs/f1_dynamic_train/sensitivity/summary.csv`
 
 ---
 
-## ⚡ 10) Add Pit-Stop & Safety-Car Regressors (Phase II)
+## 10) Add Pit-Stop & Safety-Car Regressors (Phase II)
 
 Enable in environment before running:
 ```bash
@@ -207,7 +208,7 @@ Outputs will be in `outputs/f1_dynamic_train_pit_sc/` and `outputs/f1_dynamic_te
 
 ---
 
-## 🧭 11) Cross-Split Generalization Analysis
+## 11) Cross-Split Generalization Analysis
 ```bash
 python analyze_generalization.py
 ```
@@ -216,7 +217,7 @@ Compares Brier & Log-loss differences (TEST – TRAIN) and plots driver/team rob
 
 ---
 
-## 🗂️ 12) Export Dashboard JSON
+## 12) Export Dashboard JSON
 ```bash
 python export_dashboard_json.py
 ```
@@ -225,7 +226,7 @@ Creates → `outputs/dashboard/dashboard_export.json`
 
 ---
 
-## 🖥️ 13) Launch Streamlit Dashboard
+## 13) Launch Streamlit Dashboard
 ```bash
 streamlit run dashboard_app.py
 ```
@@ -238,7 +239,7 @@ streamlit run dashboard_app.py
 
 ---
 
-## ✅ Expected Outputs Checklist
+## Expected Outputs Checklist
 
 | Folder | Key Files |
 |--------|-----------|
@@ -251,13 +252,13 @@ streamlit run dashboard_app.py
 
 ---
 
-## 🔭 Next Steps for Team (Phase III)
+## Next Steps for Team (Phase III)
 
-### 📊 1. Dashboard Refinement
+### 1. Dashboard Refinement
 - Add filters by season, weather, and track type
 - Integrate `duality_metrics.json` live updates
 
-### 🧠 2. Paper & Presentation
+### 2. Paper & Presentation
 **Will:** Model architecture, pipeline figure, calibration analysis  
 **Ashish:** Driver vs Constructor interpretation, case studies (e.g., Verstappen vs Leclerc)
 
@@ -266,7 +267,7 @@ streamlit run dashboard_app.py
 - Time–Rank duality visuals
 - Calibration curves and reliability plots
 
-### ⚙️ 3. Future Enhancements
+### 3. Future Enhancements
 - Pull real FastF1 data once API cache is enabled
 - Add track/weather-specific priors
 - Integrate live odds updates via `odds_snapshots.csv`
@@ -274,7 +275,8 @@ streamlit run dashboard_app.py
 
 ---
 
-## 👥 Authors
+## Authors
 
 **Will Arsenault & Ashish Sakhuja**  
 Penn State Sports Analytics Project (2025)
+```
