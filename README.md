@@ -1,4 +1,3 @@
-```markdown
 # Formula 1 Driver–Constructor Separation Index (DCSI)
 
 This repository implements a **Dynamic Bayesian Driver–Constructor Separation Index (DCSI)** for Formula 1 — estimating how much of a team's performance comes from the driver vs. the car.  
