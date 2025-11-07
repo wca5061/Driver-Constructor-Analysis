@@ -44,7 +44,6 @@ BASE = dict(
     use_street=True,
     use_wet=True,
     use_gridc=True,
-    # Train-only sweep; keep all seasons in TRAIN by default
     season_min=None,
     season_max=None,
 )
@@ -60,7 +59,6 @@ VARIANTS = [
     dict(name="no_wet",    use_wet=False),
     dict(name="no_gridc",  use_gridc=False),
 
-    # NUTS on a recent season subset (still TRAIN-only)
     dict(name="nuts_recent", infer="nuts", season_min="2023", season_max="2023",
          nuts_draws=800, nuts_tune=800, advi_steps=None),
 ]
@@ -77,23 +75,22 @@ teams   = pd.read_csv(os.path.join(DATA_DIR, "constructors.csv"))
 races   = pd.read_csv(os.path.join(DATA_DIR, "races.csv"))
 splits  = pd.read_csv(SPLITS_CSV)[["race_id","split"]]
 
-# Base df (names + race meta)
+# Base df
 df = (entries
       .merge(drivers[["driver_id","driver_name"]], on="driver_id", how="left")
       .merge(teams[["constructor_id","constructor_name"]], on="constructor_id", how="left")
       .merge(races[["race_id","season_id","round","track_id","weather","laps_scheduled","sc_total","rain_mm"]],
              on="race_id", how="left"))
 
-# keep usable rows
 df = df[(df["classified"] == True) & (~df["time_gap_s"].isna())].copy()
 
-# PERF target (min-max by race, higher=better)
+# PERF target (min-max per race)
 eps = 1e-6
 g = df.groupby("race_id")["time_gap_s"]
 df["perf"] = 1.0 - (df["time_gap_s"] - g.transform("min")) / (g.transform("max") - g.transform("min") + eps)
 df["perf"] = df["perf"].clip(0.0, 1.0)
 
-# ensure date for sorting (robust)
+# ensure date for sorting
 if "date" not in races.columns:
     races = races.copy()
     races["date"] = pd.to_datetime(races["season_id"].astype(str) + "-01-01") + pd.to_timedelta(races["round"] * 14, unit="D")
@@ -137,29 +134,36 @@ def run_dynamic(config: dict):
     smin            = config.get("season_min",      BASE["season_min"])
     smax            = config.get("season_max",      BASE["season_max"])
 
-    # slice seasons within TRAIN if requested
+    # make sure season_id exists
     d = df.copy()
-    if smin is not None:
+    if "season_id" not in d.columns or "round" not in d.columns:
+        races_fix = pd.read_csv(os.path.join(DATA_DIR, "races.csv"))
+        d = d.merge(races_fix[["race_id","season_id","round"]], on="race_id", how="left")
+
+    # slice seasons
+    if smin is not None and "season_id" in d.columns:
         d = d[d["season_id"].astype(str) >= str(smin)]
-    if smax is not None:
+    if smax is not None and "season_id" in d.columns:
         d = d[d["season_id"].astype(str) <= str(smax)]
 
-    # pick features
+    # features
     feats = []
     if use_gridc: feats.append("grid_c")
     if use_street: feats.append("street")
     if use_wet: feats.append("wet")
     if not feats:
-        feats = ["grid_c"]  # safe default; will be zeros if grid is constant
+        feats = ["grid_c"]
 
-    # race order (chronological within TRAIN)
-    race_order = (d[["race_id"]].drop_duplicates()
-                  .merge(races[["race_id","season_id","round","date"]], on="race_id", how="left")
-                  .sort_values(["season_id","round"])
-                  .reset_index(drop=True))
+    # race order
+    race_order = (
+        d[["race_id"]].drop_duplicates()
+        .merge(races[["race_id","season_id","round","date"]], on="race_id", how="left")
+        .sort_values(["season_id","round"])
+        .reset_index(drop=True)
+    )
     race_ids = race_order["race_id"].tolist()
 
-    # sequential priors and accumulators
+    # sequential priors
     d_prior, t_prior = {}, {}
     d_cum, t_cum = {}, {}
     rng_seed = RNG_SEED
@@ -169,7 +173,6 @@ def run_dynamic(config: dict):
         if len(rdf) < 8:
             continue
 
-        # indices
         drv_ids = rdf["driver_id"].unique().tolist()
         tm_ids  = rdf["constructor_id"].unique().tolist()
         di_map  = {x:i for i,x in enumerate(drv_ids)}
@@ -180,7 +183,6 @@ def run_dynamic(config: dict):
         di = rdf["driver_id"].map(di_map).to_numpy()
         ti = rdf["constructor_id"].map(ti_map).to_numpy()
 
-        # sequential priors
         drv_mu0 = np.array([d_prior.get(did, (0.0, prior_sd_driver))[0] for did in drv_ids])
         drv_sd0 = np.array([max(d_prior.get(did, (0.0, prior_sd_driver))[1], 0.05) for did in drv_ids])
         tm_mu0  = np.array([t_prior.get(tid, (0.0, prior_sd_team))[0] for tid in tm_ids])
@@ -210,16 +212,13 @@ def run_dynamic(config: dict):
         tm_mean  = post["theta_t"].mean(dim=["chain","draw"]).values
         tm_sd    = post["theta_t"].std(dim=["chain","draw"]).values
 
-        # update priors and accumulate
         for d_id, idx in di_map.items():
             d_prior[d_id] = (float(drv_mean[idx]), float(max(drv_sd[idx], 0.05)))
             d_cum.setdefault(d_id, []).append(drv_mean[idx])
-
         for t_id, idx in ti_map.items():
             t_prior[t_id] = (float(tm_mean[idx]), float(max(tm_sd[idx], 0.05)))
             t_cum.setdefault(t_id, []).append(tm_mean[idx])
 
-    # cumulative leaderboards
     drv_df = pd.DataFrame({
         "driver_id": list(d_cum.keys()),
         "driver_eff_cum_mean": [float(np.mean(v)) for v in d_cum.values()]
@@ -255,9 +254,8 @@ for v in VARIANTS:
     drv_v, tm_v = run_dynamic(cfg)
     save_variant(vname, drv_v, tm_v)
 
-    # rank stability vs baseline (drivers & constructors)
-    tau_d, rho_d, n_d = rank_corr(drv_base, drv_v, key="driver_id",      score_col="driver_eff_cum_mean")
-    tau_t, rho_t, n_t = rank_corr(tm_base,  tm_v,  key="constructor_id", score_col="team_eff_cum_mean")
+    tau_d, rho_d, n_d = rank_corr(drv_base, drv_v, "driver_id", "driver_eff_cum_mean")
+    tau_t, rho_t, n_t = rank_corr(tm_base, tm_v, "constructor_id", "team_eff_cum_mean")
 
     rows_summary.append({
         "variant": vname,

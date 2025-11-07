@@ -110,10 +110,11 @@ if race_df is not None:
         })
 
     # Constructor-level time series: aggregate team effect per race
+    # Replace the existing team_dcsi_ts block with this:
     grp = (
         race_df
         .groupby(
-            ["race_id", "season_id", "round", "constructor_id", "constructor_name"],
+            ["season_id", "constructor_id", "constructor_name"],
             observed=True
         )["team_eff_mean"]
         .mean()
@@ -121,14 +122,11 @@ if race_df is not None:
     )
     for _, row in grp.iterrows():
         team_dcsi_ts.append({
-            "race_id": row["race_id"],
-            "season_id": int(row.get("season_id", 0)),
-            "round": int(row.get("round", 0)),
+            "season_id": int(row["season_id"]),
             "constructor_id": row["constructor_id"],
             "constructor_name": row["constructor_name"],
-            "team_eff_mean": round_float(row.get("team_eff_mean", None)),
+            "team_eff_mean": round_float(row["team_eff_mean"]),
         })
-
 # --------- 4. Calibration metrics ---------
 
 calibration_metrics_path = IN_DIR / "prob_metrics.json"
