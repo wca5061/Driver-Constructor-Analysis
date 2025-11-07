@@ -278,4 +278,3 @@ streamlit run dashboard_app.py
 
 **Will Arsenault & Ashish Sakhuja**  
 Penn State Sports Analytics Project (2025)
-```
