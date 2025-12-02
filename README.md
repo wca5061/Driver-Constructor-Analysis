@@ -14,8 +14,6 @@ The pipeline builds synthetic (real-ish) data, performs 70/20 train-test splits,
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -U pip wheel
-pip install -r requirements.txt    # if present
-# otherwise:
 pip install numpy pandas matplotlib arviz pymc scipy fastf1 plotly streamlit
 ```
 
