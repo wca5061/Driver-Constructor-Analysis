@@ -200,7 +200,7 @@ export F1_USE_SC=1
 
 Run the full dynamic pipeline for both TRAIN and TEST splits:
 
-## 1. Train the Model
+### 1. Train the Model
 ```bash
 F1_DATA_DIR="data/synth_f1_2018_2025_realish" \
 F1_OUT_DIR="outputs/f1_dynamic_train_pit_sc" \
@@ -209,7 +209,7 @@ F1_SPLIT_TARGET=TRAIN \
 python f1_dynamic_update.py
 ```
 
-## 2. Test the Model
+### 2. Test the Model
 ```bash
 F1_DATA_DIR="data/synth_f1_2018_2025_realish" \
 F1_OUT_DIR="outputs/f1_dynamic_test_pit_sc" \
@@ -219,22 +219,22 @@ F1_PRIORS_PATH="outputs/f1_dynamic_train_pit_sc/priors.npz" \
 python f1_dynamic_update.py
 ```
 
-## 3. Convert Model Outputs to Probabilities
+### 3. Convert Model Outputs to Probabilities
 ```bash
 python make_probs_from_dynamic.py
 ```
 
-## 4. Build Explainable Rollups
+### 4. Build Explainable Rollups
 ```bash
 python build_rollups_explainable.py
 ```
 
-## 5. Time–Rank Duality Evaluation
+### 5. Time–Rank Duality Evaluation
 ```bash
 python time_rank_duality.py
 ```
 
-## Output Directories
+### Output Directories
 
 Results will be saved to:
 - `outputs/f1_dynamic_train_pit_sc/`
